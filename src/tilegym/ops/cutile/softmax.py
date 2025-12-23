@@ -279,7 +279,7 @@ class Softmax(torch.autograd.Function):
         assert not (use_tma and use_chunked), "Cannot use both TMA and chunked softmax at the same time"
         n_rows, n_cols = x.shape
         TILE_SIZE = next_power_of_2(n_cols)
-        MAX_TILE_SIZE = 4096
+        MAX_TILE_SIZE = 8192
 
         # Create output tensor
         y = torch.empty_like(x)
