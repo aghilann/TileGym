@@ -7,7 +7,6 @@ import math
 
 import cuda.tile as ct
 import torch
-from cuda.tile import RoundingMode as RMd
 
 from tilegym.backend import register_impl
 
@@ -94,9 +93,9 @@ def softmax_kernel_tma(
         ct.store(output, index=(row_idx, 0), tile=softmax_output)
 
 
-# Online softmax kernel for large tensors (3-pass algorithm)
+# Chunked softmax kernel for large tensors (3-pass algorithm)
 @ct.kernel(occupancy=4)
-def softmax_kernel_online(
+def softmax_kernel_chunked(
     output,
     input,
     n_rows: ConstInt,
@@ -111,24 +110,30 @@ def softmax_kernel_online(
         row_max = ct.full((1, 1), -math.inf, dtype=ct.float32)
         denominator = ct.full((1, 1), 0.0, dtype=ct.float32)
         num_chunks = (n_cols + TILE_SIZE - 1) // TILE_SIZE
-        
+
         # Pass 1: Find maximum
         for chunk_idx in range(num_chunks):
-            chunk = ct.load(input, index=(row_idx, chunk_idx * TILE_SIZE), shape=(1, TILE_SIZE), padding_mode=ct.PaddingMode.NEG_INF)
+            chunk = ct.load(
+                input, index=(row_idx, chunk_idx * TILE_SIZE), shape=(1, TILE_SIZE), padding_mode=ct.PaddingMode.NEG_INF
+            )
             chunk = ct.astype(chunk, ct.float32)
             row_max = ct.maximum(row_max, ct.max(chunk, 1, keepdims=True))
-        
+
         # Pass 2: First pass to compute denominator (sum of all exp values)
         for chunk_idx in range(num_chunks):
-            chunk = ct.load(input, index=(row_idx, chunk_idx * TILE_SIZE), shape=(1, TILE_SIZE), padding_mode=ct.PaddingMode.NEG_INF)
+            chunk = ct.load(
+                input, index=(row_idx, chunk_idx * TILE_SIZE), shape=(1, TILE_SIZE), padding_mode=ct.PaddingMode.NEG_INF
+            )
             chunk = ct.astype(chunk, ct.float32)
             row_minus_max = ct.sub(chunk, row_max)
             numerator = ct.exp(row_minus_max)
             denominator = ct.add(denominator, ct.sum(numerator, 1, keepdims=True))
-        
+
         # Pass 3: Compute final softmax
         for chunk_idx in range(num_chunks):
-            chunk = ct.load(input, index=(row_idx, chunk_idx * TILE_SIZE), shape=(1, TILE_SIZE), padding_mode=ct.PaddingMode.NEG_INF)
+            chunk = ct.load(
+                input, index=(row_idx, chunk_idx * TILE_SIZE), shape=(1, TILE_SIZE), padding_mode=ct.PaddingMode.NEG_INF
+            )
             chunk = ct.astype(chunk, ct.float32)
             row_minus_max = ct.sub(chunk, row_max)
             numerator = ct.exp(row_minus_max)
@@ -224,13 +229,13 @@ def launch_softmax_kernel_tma(
     )
 
 
-def launch_softmax_kernel_online(
+def launch_softmax_kernel_chunked(
     input,
     output,
     TILE_SIZE=8192,
 ):
     """
-    Launch the online cuTile softmax kernel for large tensors
+    Launch the chunked cuTile softmax kernel for large tensors
 
     Args:
         input: Input tensor of shape (n_rows, n_cols)
@@ -252,7 +257,7 @@ def launch_softmax_kernel_online(
     ct.launch(
         torch.cuda.current_stream(),
         grid,
-        softmax_kernel_online,
+        softmax_kernel_chunked,
         (
             output,
             input,
@@ -269,9 +274,9 @@ class Softmax(torch.autograd.Function):
         ctx,
         x,
         use_tma=False,
-        use_online=False,
+        use_chunked=False,
     ):
-        assert not (use_tma and use_online), "Cannot use both TMA and online softmax at the same time"
+        assert not (use_tma and use_chunked), "Cannot use both TMA and chunked softmax at the same time"
         n_rows, n_cols = x.shape
         TILE_SIZE = next_power_of_2(n_cols)
         MAX_TILE_SIZE = 4096
@@ -279,11 +284,11 @@ class Softmax(torch.autograd.Function):
         # Create output tensor
         y = torch.empty_like(x)
 
-        if use_online:
-            # Use online kernel (3-pass algorithm for large tensors)
+        if use_chunked:
+            # Use chunked kernel (3-pass algorithm for large tensors)
             # Cap TILE_SIZE at 8192 to enable chunking for very large n_cols
             # For smaller n_cols, use next_power_of_2(n_cols) to match data size
-            launch_softmax_kernel_online(x, y, TILE_SIZE=min(TILE_SIZE, MAX_TILE_SIZE))
+            launch_softmax_kernel_chunked(x, y, TILE_SIZE=min(TILE_SIZE, MAX_TILE_SIZE))
         elif use_tma:
             # Use TMA implementation
             launch_softmax_kernel_tma(x, y)
@@ -307,14 +312,14 @@ def softmax(
         use_tma: Whether to use TMA (Tensor Memory Accelerator) implementation.
                 Requires H100+ GPU (compute capability >= 9.0)
         **kwargs: Additional arguments for backend-specific configurations
-                  (e.g., use_online: whether to use online softmax implementation)
+                  (e.g., use_chunked: whether to use chunked softmax implementation)
 
     Returns:
         Softmax output tensor with gradient support
     """
-    use_online = kwargs.get("use_online", False)
+    use_chunked = kwargs.get("use_chunked", False)
     return Softmax.apply(
         x,
         use_tma,
-        use_online,
+        use_chunked,
     )
