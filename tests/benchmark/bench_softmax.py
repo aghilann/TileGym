@@ -70,7 +70,7 @@ def create_benchmark_config(M, use_tma=True, use_chunked=False):
 )
 def bench_softmax(M, N, backend, use_tma, use_chunked, dtype=torch.float32, device=DEVICE):
     # Create data
-    x = torch.randn(M, N, dtype=dtype, device=device, requires_grad=True)
+    x = torch.randn(M, N, dtype=dtype, device=device)
 
     fn = lambda: tilegym.ops.softmax(x, use_tma=use_tma, use_chunked=use_chunked, backend=backend)
     ref = lambda: reference_softmax(x)
