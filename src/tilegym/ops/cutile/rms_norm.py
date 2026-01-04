@@ -13,8 +13,8 @@ from tilegym.backend import register_impl
 from .utils import next_power_of_2
 
 
-@ct.kernel
-def rms_norm_backward_kernel_dx(
+@ct.kernel(occupancy=2)
+def rms_norm_backward_kernel(
     dx,
     dy,
     x,
@@ -118,7 +118,7 @@ def rms_norm_backward(
     ct.launch(
         torch.cuda.current_stream(),
         grid_dx,
-        rms_norm_backward_kernel_dx,
+        rms_norm_backward_kernel,
         (dx, dy, x, weight, rstd, temp_buffer, TILE_SIZE_N),
     )
 
