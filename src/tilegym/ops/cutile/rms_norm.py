@@ -11,6 +11,61 @@ from tilegym.backend import register_impl
 from .utils import next_power_of_2
 
 
+def rms_norm_backward(
+    x: torch.Tensor,
+    dy: torch.Tensor,
+    weight: torch.Tensor,
+    rstd: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Standalone RMSNorm backward pass.
+    
+    This is a debug implementation using PyTorch operations.
+    Replace with actual CuTile kernel when available.
+    
+    Args:
+        x: Input tensor of shape [M, N] or [*, N]
+        dy: Gradient of output, same shape as x
+        weight: Weight tensor of shape [N]
+        rstd: Reciprocal standard deviation of shape [M], computed during forward pass
+        
+    Returns:
+        dx: Gradient w.r.t. input x, same shape as x
+        dw: Gradient w.r.t. weight, shape [N]
+    """
+    print("USING DEBUG IMPLEMENTATION INSTEAD OF REAL KERNEL")
+    
+    x_shape = x.shape
+    x = x.reshape(-1, x.shape[-1])
+    dy = dy.reshape(-1, dy.shape[-1])
+    M, N = x.shape
+
+    # Convert to float32 for numerical stability
+    x_fp32 = x.to(torch.float32)
+    dy_fp32 = dy.to(torch.float32)
+    weight_fp32 = weight.to(torch.float32)
+
+    # Reshape rstd for broadcasting: (M,) -> (M, 1)
+    rstd = rstd.view(M, 1)
+
+    # Normalized x (before scaling by weight)
+    x_norm = x_fp32 * rstd
+
+    # Gradient w.r.t. weight: sum over batch dimension
+    dw = (dy_fp32 * x_norm).sum(dim=0)
+
+    # Gradient w.r.t. x
+    dy_weighted = dy_fp32 * weight_fp32
+    c1 = (dy_weighted * x_norm).sum(dim=1, keepdim=True)
+    dx = rstd * (dy_weighted - x_norm * c1 / N)
+
+    # Convert back to original dtype
+    dx = dx.to(x.dtype).view(x_shape)
+    dw = dw.to(weight.dtype)
+
+    return dx, dw
+
+
 @ct.kernel
 def rms_norm_kernel_gather(
     x,
@@ -22,7 +77,7 @@ def rms_norm_kernel_gather(
     TILE_SIZE: ct.Constant[int],
 ):
     """Standard RMSNorm kernel for non-static persistent mode with ptr loads"""
-    row = ct.bid(0)
+    row = ct.bid(0) # 
     _rms = ct.full((TILE_SIZE,), 0.0, dtype=ct.float32)
     num_tiles = ct.cdiv(N, TILE_SIZE)
     offsets = ct.arange(TILE_SIZE, dtype=ct.int32)
@@ -30,6 +85,7 @@ def rms_norm_kernel_gather(
     for j in range(0, num_tiles):
         offs = j * TILE_SIZE + offsets
         xj = ct.gather(x, (row, offs), latency=1)
+        # xj = ct.load(x, index=(row, j * TILE_SIZE), shape=(1, TILE_SIZE), latency=1) # TODO: Test this out
         xj = ct.astype(xj, ct.float32)
         _rms += xj * xj
 
@@ -109,11 +165,9 @@ def rms_norm_kernel_static_persistent(
         # Step 6: Apply linear transformation
         # Broadcast weight to match input shape
         w_broadcasted = ct.reshape(w, (1, TILE_SIZE_N))
-        b_broadcasted = ct.full((1, TILE_SIZE_N), 0.0, dtype=ct.float32)
 
-        # Apply linear transformation: y = x_normalized * w + b
+        # Apply linear transformation: y = x_normalized * w
         y = ct.mul(x_normalized, w_broadcasted)
-        y = ct.add(y, b_broadcasted)
 
         # Convert back to original dtype
         y = ct.astype(y, X.dtype)
@@ -244,10 +298,16 @@ class RMSNorm(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dy):
         """
-        Backward pass - currently only implemented for standard mode.
-        Static persistent mode backward pass would need additional implementation.
+        Backward pass for RMSNorm.
+        Retrieves saved tensors and delegates to rms_norm_backward().
         """
-        raise NotImplementedError("Backward pass is not implemented for RMSNorm")
+        x, weight, rstd = ctx.saved_tensors
+        
+        # Call the standalone backward function
+        dx, dw = rms_norm_backward(x, dy, weight, rstd)
+        
+        # Return gradients: (x, normalized_shape, weight, eps, bias, static_persistent)
+        return dx, None, dw, None, None, None
 
 
 @register_impl("rms_norm", backend="cutile")
