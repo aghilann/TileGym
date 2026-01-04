@@ -7,75 +7,22 @@ Standalone RMSNorm backward benchmark.
 
 This benchmark tests the backward pass in isolation WITHOUT using autograd.
 Both implementations receive the same pre-computed rstd values, ensuring
-a true apples-to-apples comparison of just the backward computation.
+a true comparison of just the backward computation.
 """
 
 import torch
 import triton
 
 from tilegym.backend import is_backend_available
+from tilegym.ops.cutile.rms_norm import compute_rstd_torch
 from tilegym.ops.cutile.rms_norm import rms_norm_backward
+from tilegym.ops.cutile.rms_norm import rms_norm_backward_torch
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 
-def rms_norm_backward_torch(
-    x: torch.Tensor,
-    dy: torch.Tensor,
-    weight: torch.Tensor,
-    rstd: torch.Tensor,
-):
-    """
-    Standalone RMSNorm backward pass using PyTorch.
-    
-    This is how torch would normally compute the backward pass.
-    rstd is pre-computed and passed in (simulating what forward would save).
-    """
-    x_shape = x.shape
-    x = x.reshape(-1, x.shape[-1])
-    dy = dy.reshape(-1, dy.shape[-1])
-    M, N = x.shape
-
-    # Convert to float32 for numerical stability
-    x_fp32 = x.to(torch.float32)
-    dy_fp32 = dy.to(torch.float32)
-    weight_fp32 = weight.to(torch.float32)
-
-    # Reshape rstd for broadcasting: (M,) -> (M, 1)
-    rstd = rstd.view(M, 1)
-
-    # Normalized x (before scaling by weight)
-    x_norm = x_fp32 * rstd
-
-    # Gradient w.r.t. weight: sum over batch dimension
-    dw = (dy_fp32 * x_norm).sum(dim=0)
-
-    # Gradient w.r.t. x
-    dy_weighted = dy_fp32 * weight_fp32
-    c1 = (dy_weighted * x_norm).sum(dim=1, keepdim=True)
-    dx = rstd * (dy_weighted - x_norm * c1 / N)
-
-    # Convert back to original dtype
-    dx = dx.to(x.dtype).view(x_shape)
-    dw = dw.to(weight.dtype)
-
-    return dx, dw
-
-
 # CuTile backward - imported from the actual implementation
 rms_norm_backward_cutile = rms_norm_backward
-
-
-def compute_rstd(x: torch.Tensor, eps: float) -> torch.Tensor:
-    """
-    Compute rstd (reciprocal standard deviation) for RMSNorm.
-    This simulates what the forward pass would save for backward.
-    """
-    x_2d = x.reshape(-1, x.shape[-1])
-    x_fp32 = x_2d.to(torch.float32)
-    variance = x_fp32.pow(2).mean(dim=-1)
-    rstd = torch.rsqrt(variance + eps)
-    return rstd
 
 
 # Backend dispatch
@@ -121,12 +68,7 @@ def create_benchmark_config(dtype):
     )
 
 
-@triton.testing.perf_report(
-    [
-        create_benchmark_config(dtype)
-        for dtype in [torch.float16, torch.bfloat16]
-    ]
-)
+@triton.testing.perf_report([create_benchmark_config(dtype) for dtype in [torch.float16, torch.bfloat16]])
 def bench_rmsnorm_backward(N, backend, dtype, M, device=DEVICE):
     eps = 1e-5
 
@@ -139,7 +81,7 @@ def bench_rmsnorm_backward(N, backend, dtype, M, device=DEVICE):
     dy = torch.randn(x_shape, dtype=dtype, device=device)
 
     # Pre-compute rstd (simulating what forward pass would save)
-    rstd = compute_rstd(x, eps)
+    rstd = compute_rstd_torch(x, eps)
 
     # Get the backward function for this backend
     backward_fn = BACKWARD_FUNCTIONS[backend]

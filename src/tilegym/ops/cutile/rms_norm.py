@@ -2,17 +2,19 @@
 #
 # SPDX-License-Identifier: MIT
 
+import math
+
 import cuda.tile as ct
 import torch
 import torch.nn as nn
-import math
 
 from tilegym.backend import register_impl
 
 from .utils import next_power_of_2
 
+
 @ct.kernel
-def rms_norm_backward_dx(
+def rms_norm_backward_kernel_dx(
     dx,
     dy,
     x,
@@ -22,16 +24,16 @@ def rms_norm_backward_dx(
 ):
     """
     Compute input gradients for RMSNorm backward pass.
-    
+
     Formula: dx_{m,i} = dy_{m,i} w_i / r_m - x_{m,i} / (N r_m^3) * sum_j dy_{m,j} w_j x_{m,j}
     where:
       - dy_{m,i} = dy[m,i] (upstream gradient)
       - w_i = weight[i] (scale parameter)
       - r_m = 1 / rstd[m] (RMS for row m)
       - N = number of columns
-    
+
     See rms_norm_backward_annotated() for detailed derivation.
-    
+
     Each block handles exactly one row and processes all columns at once.
     TILE_SIZE should be >= N (number of columns).
     """
@@ -49,7 +51,7 @@ def rms_norm_backward_dx(
     # Load weight vector and reshape for broadcasting
     weight_vector = ct.load(weight, index=(0,), shape=(TILE_SIZE,), padding_mode=ct.PaddingMode.ZERO)
     weight_vector = ct.reshape(weight_vector, (1, TILE_SIZE))  # Reshape to [1, TILE_SIZE] for broadcasting
-    
+
     # Compute sum_j dy_{m,j} w_j x_{m,j} for the correction term
     weighted_gradient_product = input_row * weight_vector * gradient_row
     weighted_gradient_sum = ct.sum(weighted_gradient_product, axis=1, keepdims=True)  # [1, 1]
@@ -60,21 +62,22 @@ def rms_norm_backward_dx(
     norm_factor = ct.full((1, 1), N * 1.0, dtype=ct.float32)  # [1, 1]
     normalization_correction_coeff = input_row * inv_std_cubed / norm_factor  # [1, TILE_SIZE]
     normalization_correction = normalization_correction_coeff * weighted_gradient_sum  # [1, TILE_SIZE]
-    
+
     # Compute direct term: dy_{m,i} w_i / r_m = gradient_row * weight_vector * inv_std_row
     scaled_gradient = gradient_row * weight_vector * inv_std_row  # [1, TILE_SIZE]
-    
+
     # Final dx: direct term minus normalization correction
     input_gradient_row = scaled_gradient - normalization_correction  # [1, TILE_SIZE]
-    
+
     # Convert back to the original dtype of dx
     input_gradient_row = ct.astype(input_gradient_row, dx.dtype)
-    
+
     # Store the result back to dx
-    ct.store(dx, index=(row_idx, 0), tile=input_gradient_row)    
+    ct.store(dx, index=(row_idx, 0), tile=input_gradient_row)
+
 
 @ct.kernel
-def rms_norm_backward_dw(
+def rms_norm_backward_kernel_dw(
     dw,
     dy,
     x,
@@ -83,41 +86,42 @@ def rms_norm_backward_dw(
 ):
     """
     Compute weight gradients for RMSNorm backward pass.
-    
+
     Formula: dw_i = sum_over_rows(dy[m,i] * x[m,i] * rstd[m])
     where rstd[m] = 1/r_m (reciprocal standard deviation for row m)
-    
+
     Each block handles exactly one column and processes all rows at once.
     TILE_SIZE should be M (number of rows).
     """
     col_idx = ct.bid(0)
     M, N = x.shape
-    
+
     # Load entire column from input and gradient
     input_col = ct.load(x, index=(0, col_idx), shape=(TILE_SIZE, 1), padding_mode=ct.PaddingMode.ZERO)
     gradient_col = ct.load(dy, index=(0, col_idx), shape=(TILE_SIZE, 1), padding_mode=ct.PaddingMode.ZERO)
-    
+
     # Load reciprocal std (1D tensor [M]) and reshape for broadcasting
     inv_std_col = ct.load(Rstd, index=(0,), shape=(TILE_SIZE,), padding_mode=ct.PaddingMode.ZERO)
     inv_std_col = ct.reshape(inv_std_col, (TILE_SIZE, 1))  # Reshape to [TILE_SIZE, 1] for broadcasting
-    
+
     # Convert to float32 for stable accumulation (matches annotated backward function)
     input_col = ct.astype(input_col, ct.float32)
     gradient_col = ct.astype(gradient_col, ct.float32)
     inv_std_col = ct.astype(inv_std_col, ct.float32)
-    
+
     # Compute element-wise: dy[m,i] * x[m,i] * rstd[m] for all rows
     column_contributions = gradient_col * input_col * inv_std_col  # [TILE_SIZE, 1]
-    
+
     # Sum over all rows to get the weight gradient for this column
     weight_gradient = ct.sum(column_contributions, axis=0, keepdims=False)  # [1]
     weight_gradient = ct.reshape(weight_gradient, (1,))  # Ensure it's [1]
-    
+
     # Convert back to the original dtype of dw
     weight_gradient = ct.astype(weight_gradient, dw.dtype)
-    
+
     # Store the result back to dw
     ct.store(dw, index=(col_idx,), tile=weight_gradient)
+
 
 def rms_norm_backward(
     x: torch.Tensor,
@@ -147,13 +151,13 @@ def rms_norm_backward(
 
     TILE_SIZE_N = next_power_of_2(N)
     TILE_SIZE_M = next_power_of_2(M)
-    
+
     # Kernel 1: dx (row-parallel)
     grid_dx = (M,)
     ct.launch(
         torch.cuda.current_stream(),
         grid_dx,
-        rms_norm_backward_dx,
+        rms_norm_backward_kernel_dx,
         (dx, dy, x, weight, rstd, TILE_SIZE_N),
     )
 
@@ -162,7 +166,7 @@ def rms_norm_backward(
     ct.launch(
         torch.cuda.current_stream(),
         grid_dw,
-        rms_norm_backward_dw,
+        rms_norm_backward_kernel_dw,
         (dw, dy, x, rstd, TILE_SIZE_M),
     )
 
@@ -181,7 +185,7 @@ def rms_norm_kernel_gather(
     TILE_SIZE: ct.Constant[int],
 ):
     """Standard RMSNorm kernel for non-static persistent mode with ptr loads"""
-    row = ct.bid(0) # 
+    row = ct.bid(0)  #
     _rms = ct.full((TILE_SIZE,), 0.0, dtype=ct.float32)
     num_tiles = ct.cdiv(N, TILE_SIZE)
     offsets = ct.arange(TILE_SIZE, dtype=ct.int32)
@@ -406,10 +410,10 @@ class RMSNorm(torch.autograd.Function):
         Retrieves saved tensors and delegates to rms_norm_backward().
         """
         x, weight, rstd = ctx.saved_tensors
-        
+
         # Call the standalone backward function
         dx, dw = rms_norm_backward(x, dy, weight, rstd)
-        
+
         # Return gradients: (x, normalized_shape, weight, eps, bias, static_persistent)
         return dx, None, dw, None, None, None
 
@@ -472,10 +476,10 @@ class TileRMSNorm(nn.Module):
         Retrieves saved tensors and delegates to rms_norm_backward().
         """
         x, weight, rstd = ctx.saved_tensors
-        
+
         # Call the standalone backward function
         dx, dw = rms_norm_backward(x, dy, weight, rstd)
-        
+
         # Return gradients: (x, normalized_shape, weight, eps, bias, static_persistent)
         return dx, None, dw, None, None, None
 
@@ -494,3 +498,80 @@ class TileRMSNorm(nn.Module):
 @register_impl("get_rms_norm_module", backend="cutile")
 def get_rms_norm_module():
     return TileRMSNorm
+
+
+def rms_norm_backward_torch(
+    x: torch.Tensor,
+    dy: torch.Tensor,
+    weight: torch.Tensor,
+    rstd: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Standalone RMSNorm backward pass using PyTorch.
+
+    This is how torch would normally compute the backward pass.
+    rstd is pre-computed and passed in (simulating what forward would save).
+
+    This is explicitly the torch reference implementation, not the cutile implementation.
+
+    Args:
+        x: Input tensor of shape [M, N] or any shape that can be reshaped to [M, N]
+        dy: Upstream gradient tensor of same shape as x
+        weight: Weight tensor of shape [N]
+        rstd: Reciprocal standard deviation tensor of shape [M] (pre-computed from forward)
+
+    Returns:
+        tuple: (dx, dw) where:
+            - dx: Gradient w.r.t. input x, same shape as x
+            - dw: Gradient w.r.t. weight, same shape as weight
+    """
+    x_shape = x.shape
+    x = x.reshape(-1, x.shape[-1])
+    dy = dy.reshape(-1, dy.shape[-1])
+    M, N = x.shape
+
+    # Convert to float32 for numerical stability
+    x_fp32 = x.to(torch.float32)
+    dy_fp32 = dy.to(torch.float32)
+    weight_fp32 = weight.to(torch.float32)
+
+    # Reshape rstd for broadcasting: (M,) -> (M, 1)
+    rstd = rstd.view(M, 1)
+
+    # Normalized x (before scaling by weight)
+    x_norm = x_fp32 * rstd
+
+    # Gradient w.r.t. weight: sum over batch dimension
+    dw = (dy_fp32 * x_norm).sum(dim=0)
+
+    # Gradient w.r.t. x
+    dy_weighted = dy_fp32 * weight_fp32
+    c1 = (dy_weighted * x_norm).sum(dim=1, keepdim=True)
+    dx = rstd * (dy_weighted - x_norm * c1 / N)
+
+    # Convert back to original dtype
+    dx = dx.to(x.dtype).view(x_shape)
+    dw = dw.to(weight.dtype)
+
+    return dx, dw
+
+
+def compute_rstd_torch(x: torch.Tensor, eps: float) -> torch.Tensor:
+    """
+    Compute rstd (reciprocal standard deviation) for RMSNorm using PyTorch.
+
+    This simulates what the forward pass would save for backward.
+
+    Args:
+        x: Input tensor of any shape
+        eps: Epsilon value for numerical stability
+
+    Returns:
+        rstd: Reciprocal standard deviation tensor of shape [M] where M is the
+              number of rows after reshaping to 2D
+    """
+    x_2d = x.reshape(-1, x.shape[-1])
+    x_fp32 = x_2d.to(torch.float32)
+    variance = x_fp32.pow(2).mean(dim=-1)
+    rstd = torch.rsqrt(variance + eps)
+    return rstd
