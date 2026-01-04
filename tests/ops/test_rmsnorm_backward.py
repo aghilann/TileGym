@@ -6,8 +6,7 @@ import pytest
 import torch
 
 import tilegym
-from tilegym.ops.cutile.rms_norm import compute_rstd_torch
-from tilegym.ops.cutile.rms_norm import rms_norm_backward_torch
+from tilegym.ops.cutile.rms_norm import TileRMSNorm
 
 from .. import common
 from ..common import markif
@@ -20,7 +19,7 @@ class Test_RMSNormBackward(common.PyTestCase):
         Reference implementation for RMSNorm backward pass using PyTorch.
         Uses the shared torch reference implementation.
         """
-        return rms_norm_backward_torch(x, dy, weight, rstd)
+        return TileRMSNorm.rms_norm_backward_torch(x, dy, weight, rstd)
 
     _backends = ["cutile"]
 
@@ -57,7 +56,7 @@ class Test_RMSNormBackward(common.PyTestCase):
         dy = torch.randn(x_shape, dtype=dtype, device=device)
 
         # Compute rstd (simulating what forward pass would save)
-        rstd = compute_rstd_torch(x, eps)
+        rstd = TileRMSNorm.compute_rstd_torch(x, eps)
 
         # Import the backward function
         from tilegym.ops.cutile.rms_norm import rms_norm_backward

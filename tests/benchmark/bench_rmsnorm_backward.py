@@ -14,15 +14,17 @@ import torch
 import triton
 
 from tilegym.backend import is_backend_available
-from tilegym.ops.cutile.rms_norm import compute_rstd_torch
+from tilegym.ops.cutile.rms_norm import TileRMSNorm
 from tilegym.ops.cutile.rms_norm import rms_norm_backward
-from tilegym.ops.cutile.rms_norm import rms_norm_backward_torch
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 
 # CuTile backward - imported from the actual implementation
 rms_norm_backward_cutile = rms_norm_backward
+
+# Torch backward - static method on TileRMSNorm class
+rms_norm_backward_torch = TileRMSNorm.rms_norm_backward_torch
 
 
 # Backend dispatch
@@ -81,7 +83,7 @@ def bench_rmsnorm_backward(N, backend, dtype, M, device=DEVICE):
     dy = torch.randn(x_shape, dtype=dtype, device=device)
 
     # Pre-compute rstd (simulating what forward pass would save)
-    rstd = compute_rstd_torch(x, eps)
+    rstd = TileRMSNorm.compute_rstd_torch(x, eps)
 
     # Get the backward function for this backend
     backward_fn = BACKWARD_FUNCTIONS[backend]
