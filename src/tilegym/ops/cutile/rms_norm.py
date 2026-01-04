@@ -193,7 +193,6 @@ def rms_norm_kernel_gather(
     for j in range(0, num_tiles):
         offs = j * TILE_SIZE + offsets
         xj = ct.gather(x, (row, offs), latency=1)
-        # xj = ct.load(x, index=(row, j * TILE_SIZE), shape=(1, TILE_SIZE), latency=1) # TODO: Test this out
         xj = ct.astype(xj, ct.float32)
         _rms += xj * xj
 
@@ -273,9 +272,11 @@ def rms_norm_kernel_static_persistent(
         # Step 6: Apply linear transformation
         # Broadcast weight to match input shape
         w_broadcasted = ct.reshape(w, (1, TILE_SIZE_N))
+        b_broadcasted = ct.full((1, TILE_SIZE_N), 0.0, dtype=ct.float32)
 
-        # Apply linear transformation: y = x_normalized * w
+        # Apply linear transformation: y = x_normalized * w + b
         y = ct.mul(x_normalized, w_broadcasted)
+        y = ct.add(y, b_broadcasted)
 
         # Convert back to original dtype
         y = ct.astype(y, X.dtype)
