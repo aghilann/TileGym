@@ -20,6 +20,7 @@ def rms_norm_backward_kernel_dx(
     x,
     weight,
     Rstd,
+    temp_buffer,
     TILE_SIZE: ct.Constant[int],
 ):
     """
@@ -53,7 +54,13 @@ def rms_norm_backward_kernel_dx(
     weight_vector = ct.reshape(weight_vector, (1, TILE_SIZE))  # Reshape to [1, TILE_SIZE] for broadcasting
 
     # Compute sum_j dy_{m,j} w_j x_{m,j} for the correction term
-    weighted_gradient_product = input_row * weight_vector * gradient_row
+
+    c1 = input_row * gradient_row
+    c2 = c1 * inv_std_row
+
+    ct.store(temp_buffer, index=(row_idx, 0), tile=ct.astype(c2, temp_buffer.dtype))
+
+    weighted_gradient_product = c1 * weight_vector
     weighted_gradient_sum = ct.sum(weighted_gradient_product, axis=1, keepdims=True)  # [1, 1]
 
     # Compute normalization correction: x_{m,i} / (N r_m^3) * sum_j dy_{m,j} w_j x_{m,j}
@@ -74,53 +81,6 @@ def rms_norm_backward_kernel_dx(
 
     # Store the result back to dx
     ct.store(dx, index=(row_idx, 0), tile=input_gradient_row)
-
-
-@ct.kernel
-def rms_norm_backward_kernel_dw(
-    dw,
-    dy,
-    x,
-    Rstd,
-    TILE_SIZE: ct.Constant[int],
-):
-    """
-    Compute weight gradients for RMSNorm backward pass.
-
-    Formula: dw_i = sum_over_rows(dy[m,i] * x[m,i] * rstd[m])
-    where rstd[m] = 1/r_m (reciprocal standard deviation for row m)
-
-    Each block handles exactly one column and processes all rows at once.
-    TILE_SIZE should be M (number of rows).
-    """
-    col_idx = ct.bid(0)
-    M, N = x.shape
-
-    # Load entire column from input and gradient
-    input_col = ct.load(x, index=(0, col_idx), shape=(TILE_SIZE, 1), padding_mode=ct.PaddingMode.ZERO)
-    gradient_col = ct.load(dy, index=(0, col_idx), shape=(TILE_SIZE, 1), padding_mode=ct.PaddingMode.ZERO)
-
-    # Load reciprocal std (1D tensor [M]) and reshape for broadcasting
-    inv_std_col = ct.load(Rstd, index=(0,), shape=(TILE_SIZE,), padding_mode=ct.PaddingMode.ZERO)
-    inv_std_col = ct.reshape(inv_std_col, (TILE_SIZE, 1))  # Reshape to [TILE_SIZE, 1] for broadcasting
-
-    # Convert to float32 for stable accumulation (matches annotated backward function)
-    input_col = ct.astype(input_col, ct.float32)
-    gradient_col = ct.astype(gradient_col, ct.float32)
-    inv_std_col = ct.astype(inv_std_col, ct.float32)
-
-    # Compute element-wise: dy[m,i] * x[m,i] * rstd[m] for all rows
-    column_contributions = gradient_col * input_col * inv_std_col  # [TILE_SIZE, 1]
-
-    # Sum over all rows to get the weight gradient for this column
-    weight_gradient = ct.sum(column_contributions, axis=0, keepdims=False)  # [1]
-    weight_gradient = ct.reshape(weight_gradient, (1,))  # Ensure it's [1]
-
-    # Convert back to the original dtype of dw
-    weight_gradient = ct.astype(weight_gradient, dw.dtype)
-
-    # Store the result back to dw
-    ct.store(dw, index=(col_idx,), tile=weight_gradient)
 
 
 def rms_norm_backward(
@@ -145,30 +105,29 @@ def rms_norm_backward(
     # Allocate outputs
     dx = torch.empty_like(x)
     dw = torch.empty_like(weight)  # shape (N,)
+    temp_buffer = torch.empty(x.shape, device=x.device, dtype=torch.float32)
 
     dx = dx.detach()
     dw = dw.detach()
 
     TILE_SIZE_N = next_power_of_2(N)
-    TILE_SIZE_M = next_power_of_2(M)
 
-    # Kernel 1: dx (row-parallel)
+    # dx (row-parallel) algorithim
+    # Also stores dy * x / rms into temp_buffer for each row
     grid_dx = (M,)
     ct.launch(
         torch.cuda.current_stream(),
         grid_dx,
         rms_norm_backward_kernel_dx,
-        (dx, dy, x, weight, rstd, TILE_SIZE_N),
+        (dx, dy, x, weight, rstd, temp_buffer, TILE_SIZE_N),
     )
 
-    # Kernel 2: dw (column-parallel)
-    grid_dw = (N,)
-    ct.launch(
-        torch.cuda.current_stream(),
-        grid_dw,
-        rms_norm_backward_kernel_dw,
-        (dw, dy, x, rstd, TILE_SIZE_M),
-    )
+    # Compute dw by summing temp_buffer over the batch dimension
+    # temp_buffer contains: dy_{b,j} * x_{b,j} / rms_b (shape [M, N])
+    # dw_j = sum_b(dy_{b,j} * x_{b,j} / rms_b) * weight_j
+    # temp_buffer already has dy * x * rstd, so we just sum over row dim (torch performance would be the same as cuTILE)
+    # Ensure accumulates are done in float32 to avoid precision issues
+    dw = temp_buffer[:, :N].to(torch.float32).sum(dim=0).to(weight.dtype)
 
     # Reshape dx back, dw already correct
     return dx.view(*x_shape), dw
@@ -514,27 +473,24 @@ class TileRMSNorm(nn.Module):
         dy = dy.reshape(-1, dy.shape[-1])
         M, N = x.shape
 
-        # Convert to float32 for numerical stability
-        x_fp32 = x.to(torch.float32)
-        dy_fp32 = dy.to(torch.float32)
-        weight_fp32 = weight.to(torch.float32)
-
         # Reshape rstd for broadcasting: (M,) -> (M, 1)
         rstd = rstd.view(M, 1)
 
-        # Normalized x (before scaling by weight)
-        x_norm = x_fp32 * rstd
+        # Gradient w.r.t. weight: sum over batch dimension (accumulate in float32)
+        # Match kernel order: (x * dy) * rstd to match precision behavior
+        dw = ((x * dy) * rstd).sum(dim=0, dtype=torch.float32)
 
-        # Gradient w.r.t. weight: sum over batch dimension
-        dw = (dy_fp32 * x_norm).sum(dim=0)
+        # Normalized x (before scaling by weight) - for dx computation
+        x_norm = x * rstd
 
-        # Gradient w.r.t. x
-        dy_weighted = dy_fp32 * weight_fp32
-        c1 = (dy_weighted * x_norm).sum(dim=1, keepdim=True)
+        # Gradient w.r.t. x (accumulate in float32)
+        dy_weighted = dy * weight
+        c1 = (dy_weighted * x_norm).sum(
+            dim=1, keepdim=True, dtype=torch.float32
+        )  # ensure accumulates are done in float32 to avoid precision issues
         dx = rstd * (dy_weighted - x_norm * c1 / N)
 
-        # Convert back to original dtype
-        dx = dx.to(x.dtype).view(x_shape)
+        dx = dx.view(x_shape).to(x.dtype)
         dw = dw.to(weight.dtype)
 
         return dx, dw

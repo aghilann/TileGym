@@ -70,7 +70,9 @@ def create_benchmark_config(dtype):
     )
 
 
-@triton.testing.perf_report([create_benchmark_config(dtype) for dtype in [torch.float16, torch.bfloat16]])
+@triton.testing.perf_report(
+    [create_benchmark_config(dtype) for dtype in [torch.bfloat16, torch.float16, torch.float32]]
+)
 def bench_rmsnorm_backward(N, backend, dtype, M, device=DEVICE):
     eps = 1e-5
 
@@ -114,7 +116,9 @@ def bench_rmsnorm_backward(N, backend, dtype, M, device=DEVICE):
     dx_bytes = x.numel() * bytes_per_element  # Write dx
     dw_bytes = weight.numel() * bytes_per_element  # Write dw
 
-    total_bytes = input_x_bytes + dy_bytes + weight_bytes + rstd_bytes + dx_bytes + dw_bytes
+    temp_buffer_bytes = x.numel() * 4 * 2  # always write + read float32
+
+    total_bytes = input_x_bytes + dy_bytes + weight_bytes + rstd_bytes + dx_bytes + dw_bytes + temp_buffer_bytes
 
     # Convert to GB/s
     gb_per_s = total_bytes * 1e-9 / (ms * 1e-3)
