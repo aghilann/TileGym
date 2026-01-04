@@ -5,11 +5,60 @@
 import cuda.tile as ct
 import torch
 import torch.nn as nn
+import math
 
 from tilegym.backend import register_impl
 
 from .utils import next_power_of_2
 
+@ct.kernel
+def rms_norm_backward_dx(
+    dx,
+    dy,
+    x,
+    weight,
+    Rstd,
+    TILE_SIZE: ct.Constant[int],
+):
+    row_idx = ct.bid(0)
+    M, N = x.shape
+
+    input_row = ct.load(x, index=(row_idx, 0), shape=(1, TILE_SIZE), padding_mode=ct.PaddingMode.ZERO)
+    gradient_row = ct.load(dy, index=(row_idx, 0), shape=(1, TILE_SIZE), padding_mode=ct.PaddingMode.ZERO)
+
+    inv_std_row = ct.load(Rstd, index=(row_idx,), shape=(1,), padding_mode=ct.PaddingMode.ZERO)  # Load 1D tensor [M]
+    inv_std_row = ct.reshape(inv_std_row, (1, 1))  # Reshape to [1, 1] for broadcasting
+
+    weight_vector = ct.load(weight, index=(0,), shape=(TILE_SIZE,), padding_mode=ct.PaddingMode.ZERO)
+    weight_vector = ct.reshape(weight_vector, (1, TILE_SIZE))  # Reshape for broadcasting [1, TILE_SIZE]
+    
+    
+    weighted_gradient_product = input_row * weight_vector * gradient_row
+    weighted_gradient_sum = ct.sum(weighted_gradient_product, axis=1, keepdims=True)  # [1, 1]
+
+    # Compute x_i / (N * r^3)
+    # Since inv_std_row = 1/r, we have r = 1/inv_std, so r^3 = 1/(inv_std^3)
+    # Therefore: x_i / (N * r^3) = x_i / (N * 1/(inv_std^3)) = x_i * inv_std^3 / N
+    inv_std_cubed = inv_std_row * inv_std_row * inv_std_row  # [1, 1]
+    norm_factor = ct.full((1, 1), N * 1.0, dtype=ct.float32)  # [1, 1]
+    normalization_correction_coeff = input_row * inv_std_cubed / norm_factor  # [1, TILE_SIZE]
+    
+    # Element-wise multiply: x_i / (N * r^3) * Σ_j (g_j γ_j x_j)
+    # weighted_gradient_sum [1, 1] will broadcast across normalization_correction_coeff [1, TILE_SIZE]
+    normalization_correction = normalization_correction_coeff * weighted_gradient_sum  # [1, TILE_SIZE]
+    
+    # Compute (g_i γ_i) / r = gradient_row * weight_vector / r = gradient_row * weight_vector * inv_std_row
+    # Since inv_std_row = 1/r, we multiply by inv_std_row instead of dividing by r
+    scaled_gradient = gradient_row * weight_vector * inv_std_row  # [1, TILE_SIZE]
+    
+    # Final dx: (g_i γ_i) / r - x_i / (N * r^3) * Σ_j (g_j γ_j x_j)
+    input_gradient_row = scaled_gradient - normalization_correction  # [1, TILE_SIZE]
+    
+    # Convert back to the original dtype of dx
+    input_gradient_row = ct.astype(input_gradient_row, dx.dtype)
+    
+    # Store the result back to dx
+    ct.store(dx, index=(row_idx, 0), tile=input_gradient_row)    
 
 def rms_norm_backward(
     x: torch.Tensor,
@@ -17,53 +66,119 @@ def rms_norm_backward(
     weight: torch.Tensor,
     rstd: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Standalone RMSNorm backward pass.
-    
-    This is a debug implementation using PyTorch operations.
-    Replace with actual CuTile kernel when available.
-    
-    Args:
-        x: Input tensor of shape [M, N] or [*, N]
-        dy: Gradient of output, same shape as x
-        weight: Weight tensor of shape [N]
-        rstd: Reciprocal standard deviation of shape [M], computed during forward pass
-        
-    Returns:
-        dx: Gradient w.r.t. input x, same shape as x
-        dw: Gradient w.r.t. weight, shape [N]
-    """
-    print("USING DEBUG IMPLEMENTATION INSTEAD OF REAL KERNEL")
-    
+    x = x.contiguous()
+    dy = dy.contiguous()
+    weight = weight.contiguous()
+    rstd = rstd.contiguous()
+
     x_shape = x.shape
-    x = x.reshape(-1, x.shape[-1])
+
+    x.reshape(-1, x.shape[-1])
     dy = dy.reshape(-1, dy.shape[-1])
+
+    dx = torch.empty_like(x)
+    dw = torch.empty_like(weight)
+
+    dx = dx.detach()
+    dw = dw.detach()
+    
     M, N = x.shape
+    TILE_SIZE = next_power_of_2(N)
+    
+    rms_norm_backward_dx
+    grid = (M,)
+    ct.launch(
+        torch.cuda.current_stream(),
+        grid,
+        rms_norm_backward_dx,
+        (dx, dy, x, weight, rstd, TILE_SIZE),
+    )
 
-    # Convert to float32 for numerical stability
+    return dx, None
+
+
+def rms_norm_backward_annotated(
+    x: torch.Tensor,
+    dy: torch.Tensor,
+    weight: torch.Tensor,
+    rstd: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    # Shapes:
+    #   x     : [..., N]   # input activations (flattened to [M, N])
+    #   dy    : [..., N]   # upstream gradient dL/dy (same shape as x)
+    #   weight: [N]        # RMSNorm scale parameters γ
+    #   rstd  : [M]        # per-row reciprocal RMS, rstd[m] = 1 / r_m
+    RMSNorm backward pass.
+
+    Math:
+      r_m = sqrt((1/N) * sum_i x_{m,i}^2 + eps)
+      y_{m,i} = γ_i * x_{m,i} / r_m
+
+      Given g_{m,i} = dL / dy_{m,i}
+
+      dx_{m,i} =
+        g_{m,i} γ_i / r_m
+        - x_{m,i} / (N r_m^3) * sum_j g_{m,j} γ_j x_{m,j}
+
+      dγ_i = sum_m g_{m,i} * x_{m,i} / r_m
+    """
+
+    print("USING DEBUG IMPLEMENTATION INSTEAD OF REAL KERNEL")
+
+    x_shape = x.shape
+    # Save original tensor shape so dx can be reshaped back later
+
+    x = x.reshape(-1, x.shape[-1])
+    # Interpret x as a matrix x_{m,i} ∈ ℝ^{M×N}
+
+    dy = dy.reshape(-1, dy.shape[-1])
+    # Interpret upstream gradient as g_{m,i} = ∂L/∂y_{m,i}
+
+    M, N = x.shape
+    # M = number of rows, N = hidden dimension
+
     x_fp32 = x.to(torch.float32)
+    # Convert x_{m,i} to float32 for stable accumulation
+
     dy_fp32 = dy.to(torch.float32)
+    # Convert g_{m,i} to float32
+
     weight_fp32 = weight.to(torch.float32)
+    # Convert γ_i to float32
 
-    # Reshape rstd for broadcasting: (M,) -> (M, 1)
     rstd = rstd.view(M, 1)
+    # Reshape rstd_m = 1 / r_m to shape (M, 1) for broadcasting
 
-    # Normalized x (before scaling by weight)
     x_norm = x_fp32 * rstd
+    # x_norm_{m,i} = x_{m,i} / r_m
 
-    # Gradient w.r.t. weight: sum over batch dimension
     dw = (dy_fp32 * x_norm).sum(dim=0)
+    # dγ_i = sum_m g_{m,i} * x_{m,i} / r_m
+    # Sum over rows because γ_i is shared across all rows
 
-    # Gradient w.r.t. x
     dy_weighted = dy_fp32 * weight_fp32
-    c1 = (dy_weighted * x_norm).sum(dim=1, keepdim=True)
-    dx = rstd * (dy_weighted - x_norm * c1 / N)
+    # dy_weighted_{m,i} = g_{m,i} * γ_i
 
-    # Convert back to original dtype
+    c1 = (dy_weighted * x_norm).sum(dim=1, keepdim=True)
+    # c1_m = sum_i g_{m,i} * γ_i * (x_{m,i} / r_m)
+    #      = (1 / r_m) * sum_i g_{m,i} γ_i x_{m,i}
+    # This is the per-row dot product scalar
+
+    dx = rstd * (dy_weighted - x_norm * c1 / N)
+    # dx_{m,i} =
+    #   (g_{m,i} γ_i) / r_m
+    #   - x_{m,i} / (N r_m^3) * sum_j g_{m,j} γ_j x_{m,j}
+    # Direct term minus rank-1 correction
+
     dx = dx.to(x.dtype).view(x_shape)
+    # Cast dx back to original dtype and reshape to original x shape
+
     dw = dw.to(weight.dtype)
+    # Cast dγ back to original weight dtype
 
     return dx, dw
+    # Return gradients w.r.t. input and weight
 
 
 @ct.kernel
@@ -360,6 +475,20 @@ class TileRMSNorm(nn.Module):
             self.variance_epsilon,
             static_persistent=static_persistent,
         )
+
+    @staticmethod
+    def backward(ctx, dy):
+        """
+        Backward pass for RMSNorm.
+        Retrieves saved tensors and delegates to rms_norm_backward().
+        """
+        x, weight, rstd = ctx.saved_tensors
+        
+        # Call the standalone backward function
+        dx, dw = rms_norm_backward(x, dy, weight, rstd)
+        
+        # Return gradients: (x, normalized_shape, weight, eps, bias, static_persistent)
+        return dx, None, dw, None, None, None
 
     def forward_torch(self, hidden_states):
         """PyTorch reference implementation for comparison"""
