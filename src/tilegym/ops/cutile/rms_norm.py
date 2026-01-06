@@ -144,7 +144,7 @@ def rms_norm_kernel_gather(
     TILE_SIZE: ct.Constant[int],
 ):
     """Standard RMSNorm kernel for non-static persistent mode with ptr loads"""
-    row = ct.bid(0)  #
+    row = ct.bid(0)
     _rms = ct.full((TILE_SIZE,), 0.0, dtype=ct.float32)
     num_tiles = ct.cdiv(N, TILE_SIZE)
     offsets = ct.arange(TILE_SIZE, dtype=ct.int32)
