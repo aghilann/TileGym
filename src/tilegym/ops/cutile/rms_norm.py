@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 
 from tilegym.backend import register_impl
+from tilegym.experimental import experimental_kernel
 
 from .utils import next_power_of_2
 
@@ -145,6 +146,7 @@ def rms_norm_kernel_static_persistent(
         )
 
 
+@experimental_kernel
 @ct.kernel(occupancy=1)
 def _rms_bwd(dx, dy, x, weight, Rstd, dw_partial, TILE_M: ct.Constant[int], TILE_N: ct.Constant[int]):
     """
@@ -373,32 +375,10 @@ class RMSNorm(torch.autograd.Function):
             )
 
         x, weight, rstd = ctx.saved_tensors
-        shape = x.shape
-        N = shape[-1]
-        x2 = x.reshape(-1, N)
-        M = x2.shape[0]
-        dy2 = dy.reshape(-1, N)
-        if not dy2.is_contiguous():
-            dy2 = dy2.contiguous()
-
-        cfg = _bwd_cfg.get((M, N))
-        if cfg is None:
-            cfg = _bwd_tiles(M, N)
-            _bwd_cfg[(M, N)] = cfg
-        tm, T, g, No = cfg
-
-        stream = torch.cuda.current_stream()
-
-        dx = torch.empty_like(x2)
-        dwp = torch.empty((g, T), device=x.device, dtype=torch.float32)
-        ct.launch(stream, (g,), _rms_bwd, (dx, dy2, x2, weight, rstd, dwp, tm, T))
-
-        dw = dwp.sum(0)
-        if T != No:
-            dw = dw[:No]
+        dx, dw = rms_norm_backward(x, dy, weight, rstd)
 
         # Gradients: (x, normalized_shape, weight, eps, bias, static_persistent, offset)
-        return dx.view(shape), None, dw.to(weight.dtype), None, None, None, None
+        return dx, None, dw, None, None, None, None
 
 
 @register_impl("rms_norm", backend="cutile")
