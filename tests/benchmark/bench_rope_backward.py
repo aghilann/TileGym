@@ -7,61 +7,16 @@
 import torch
 import triton
 import triton.testing
+from bench_rope import DEVICE
+from bench_rope import apply_rope_torch
+from bench_rope import create_rotary_embeddings
+from bench_rope import get_supported_backends
 
 import tilegym
-from tilegym.backend import is_backend_available
-from tilegym.backend import register_impl
-
-DEVICE = triton.runtime.driver.active.get_active_torch_device()
-
-
-def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def apply_rope_torch(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    position_ids: torch.Tensor = None,  # Unused, kept for compatibility
-    unsqueeze_dim: int = 1,
-    use_tma: bool = False,  # Unused, kept for compatibility
-):
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
-
-
-register_impl("apply_rope_base", "torch")(apply_rope_torch)
-
-
-def create_rotary_embeddings(seq_len: int, head_dim: int, dtype: torch.dtype, device, base: float = 10000.0):
-    freqs = 1.0 / (base ** (torch.arange(0, head_dim, 2, dtype=torch.float32, device=device) / head_dim))
-    t = torch.arange(seq_len, device=device, dtype=torch.float32)
-    freqs = torch.outer(t, freqs)
-
-    cos_half = torch.cos(freqs).to(dtype)
-    sin_half = torch.sin(freqs).to(dtype)
-
-    cos = torch.cat([cos_half, cos_half], dim=-1)
-    sin = torch.cat([sin_half, sin_half], dim=-1)
-    return cos, sin
-
-
-def get_providers():
-    providers = [("torch", "PyTorch", ("green", "-"))]
-    if is_backend_available("cutile"):
-        providers.insert(0, ("cutile", "CuTile", ("orange", "-")))
-    return providers
 
 
 def create_benchmark_config(mode: str, dtype: torch.dtype, bsz: int, num_heads: int, head_dim: int):
-    providers = get_providers()
+    providers = get_supported_backends(dtype)
     if not providers:
         return None
 
@@ -120,14 +75,12 @@ def bench_rope_backward(
     cos_ref = cos_ref.unsqueeze(0)
     sin_ref = sin_ref.unsqueeze(0)
 
-    tilegym.set_backend("torch")
-    oq_t, ok_t = tilegym.ops.apply_rope_base(q_ref, k_ref, cos_ref, sin_ref, pos_ids_ref)
+    oq_t, ok_t = apply_rope_torch(q_ref, k_ref, cos_ref, sin_ref, pos_ids_ref)
     gq_t = torch.randn_like(oq_t)
     gk_t = torch.randn_like(ok_t)
     (oq_t * gq_t + ok_t * gk_t).sum().backward()
 
-    tilegym.set_backend(backend)
-    oq_c, ok_c = tilegym.ops.apply_rope_base(q_opt, k_opt, cos_ref, sin_ref, pos_ids_ref)
+    oq_c, ok_c = tilegym.ops.apply_rope_base(q_opt, k_opt, cos_ref, sin_ref, pos_ids_ref, backend=backend)
     (oq_c * gq_t + ok_c * gk_t).sum().backward()
 
     torch.testing.assert_close(oq_c, oq_t, atol=1e-2, rtol=1e-2)
@@ -150,8 +103,7 @@ def bench_rope_backward(
     if mode == "backward":
         q = q_base.detach().clone().requires_grad_(True)
         k = k_base.detach().clone().requires_grad_(True)
-        tilegym.set_backend(backend)
-        out_q, out_k = tilegym.ops.apply_rope_base(q, k, cos, sin, pos_ids)
+        out_q, out_k = tilegym.ops.apply_rope_base(q, k, cos, sin, pos_ids, backend=backend)
         grad_q = torch.randn_like(out_q)
         grad_k = torch.randn_like(out_k)
 
@@ -166,8 +118,7 @@ def bench_rope_backward(
         def full_pass():
             q = q_base.detach().clone().requires_grad_(True)
             k = k_base.detach().clone().requires_grad_(True)
-            tilegym.set_backend(backend)
-            out_q, out_k = tilegym.ops.apply_rope_base(q, k, cos, sin, pos_ids)
+            out_q, out_k = tilegym.ops.apply_rope_base(q, k, cos, sin, pos_ids, backend=backend)
             grad_q = torch.randn_like(out_q)
             grad_k = torch.randn_like(out_k)
             (out_q * grad_q + out_k * grad_k).sum().backward()
