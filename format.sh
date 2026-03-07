@@ -22,11 +22,11 @@ python3 .github/scripts/check_spdx_headers.py --action write
 
 echo ""
 echo "📋 Sorting imports..."
-python3 -m ruff check --select I --fix .
+python3 -m ruff check --select I --fix --exclude .venv --force-exclude .
 
 echo ""
 echo "✨ Formatting code..."
-python3 -m ruff format .
+python3 -m ruff format --exclude .venv --force-exclude .
 
 echo ""
 echo "✅ Done! SPDX headers added, code is formatted, and imports are sorted."
