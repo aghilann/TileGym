@@ -2,18 +2,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-# Benchmark script for LLaMA-3.1-8B model
+# Benchmark script for Phi-3-mini-4k-instruct model
 # Compares PyTorch baseline vs TileGym CUTILE backend
 
 set -e
 
-MODEL_ID="meta-llama/Meta-Llama-3.1-8B"
-INPUT_FILE="sample_inputs/input_prompt_32K.txt"
+MODEL_ID="microsoft/Phi-3-mini-4k-instruct"
+INPUT_FILE="sample_inputs/input_prompt_small.txt"
 OUTPUT_LENGTH=50
-SUMMARY_FILE="llama_benchmark_summary.txt"
+SUMMARY_FILE="phi3_benchmark_summary.txt"
 
 echo "========================================"
-echo "  LLaMA-3.1-8B Performance Benchmark"
+echo "  Phi-3-mini-4k-instruct Benchmark"
 echo "========================================"
 echo ""
 echo "Model: ${MODEL_ID}"

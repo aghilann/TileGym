@@ -2,6 +2,8 @@
 
 <!--- SPDX-License-Identifier: MIT --->
 
+English | [简体中文](README_chs.md) | [繁體中文](README_cht.md) | [日本語](README_ja.md) | [Français](README_fr.md)
+
 # TileGym
 
 TileGym is a CUDA Tile kernel library that provides a rich collection of kernel tutorials and examples for tile-based GPU programming.
@@ -52,13 +54,17 @@ We have verified that `torch==2.9.1` works. You can also get `triton` packages w
 ```bash
 git clone <tilegym-repository-url>
 cd tilegym
+pip install -r requirements.txt
 pip install .
 ```
+
+All runtime dependencies are declared in [`requirements.txt`](requirements.txt). Running `pip install .` also installs them automatically, but you can pre-install with `pip install -r requirements.txt` if you prefer an explicit step.
+
 It will automatically install `cuda-tile`, see https://github.com/nvidia/cutile-python.
 
 If you want to use edit mode for `TileGym`, run `pip install -e .`
 
-We also provide Dockfile, you can refer to [modeling/transformers/README.md](modeling/transformers/README.md).
+We also provide Dockerfile, you can refer to [modeling/transformers/README.md](modeling/transformers/README.md).
 
 ## Quick Start
 
