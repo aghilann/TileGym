@@ -89,7 +89,7 @@ def swiglu_backward_kernel(dc, a, b, da, db, TILE_SIZE: ct.Constant[int]):
     b_tile_f32 = b_tile.astype(ct.float32)
 
     sigmoid_a = sigmoid(a_tile_f32)
-    silu_a = silu(a_tile_f32)
+    silu_a = a_tile_f32 * sigmoid_a
 
     # db = dc * silu(a)
     db_tile = dc_tile * silu_a
